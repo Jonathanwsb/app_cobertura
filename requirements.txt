@@ -2,4 +2,6 @@ streamlit
 geopandas
 pyogrio
 pandas
+numpy
+pydeck
 openpyxl
