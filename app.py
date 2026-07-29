@@ -11,6 +11,7 @@ import streamlit as st
 st.set_page_config(page_title="Cobertura de Esgoto - Buffer 15m", layout="wide")
 
 BUFFER_M = 15
+BUFFER_RESOLUTION = 5  # segmentos por quadrante - igual ao padrão do QGIS, garante números idênticos
 TREAT_COL_CANDIDATES = ["Tratamento", "TRATAMENTO", "tratamento"]
 TREAT_VALUE = "Sim"
 MAX_PONTOS_MAPA = 40000  # limite de pontos plotados no mapa (performance do navegador)
@@ -60,7 +61,7 @@ def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes: bytes):
     total_pontos = len(cnefe)
 
     # --- Rede total ---
-    buffer_total = rede.geometry.buffer(BUFFER_M).union_all()
+    buffer_total = rede.geometry.buffer(BUFFER_M, resolution=BUFFER_RESOLUTION).union_all()
     dentro_total = cnefe.within(buffer_total)
     qtd_total = int(dentro_total.sum())
 
@@ -69,7 +70,7 @@ def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes: bytes):
     if col_trat is not None:
         rede_trat = rede[rede[col_trat].astype(str).str.strip().str.lower() == TREAT_VALUE.lower()]
         if len(rede_trat) > 0:
-            buffer_trat = rede_trat.geometry.buffer(BUFFER_M).union_all()
+            buffer_trat = rede_trat.geometry.buffer(BUFFER_M, resolution=BUFFER_RESOLUTION).union_all()
             dentro_trat = cnefe.within(buffer_trat)
             qtd_trat = int(dentro_trat.sum())
         else:
