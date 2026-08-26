@@ -10,7 +10,6 @@ import streamlit as st
 
 st.set_page_config(page_title="Cobertura de Esgoto - Buffer 15m", layout="wide")
 
-BUFFER_M = 15
 BUFFER_RESOLUTION = 5  # segmentos por quadrante - igual ao padrão do QGIS, garante números idênticos
 TREAT_COL_CANDIDATES = ["Tratamento", "TRATAMENTO", "tratamento"]
 TREAT_VALUE = "Sim"
@@ -45,7 +44,7 @@ def encontrar_coluna_tratamento(gdf: gpd.GeoDataFrame):
     return None
 
 
-def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes: bytes):
+def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes: bytes, buffer_m: float):
     """Processa um par (rede, cnefe). Retorna (dict de resultados, gdf cnefe
     classificado em EPSG:4326, gdf rede em EPSG:4326)."""
     rede = gpd.read_file(io.BytesIO(rede_bytes), driver="GPKG")
@@ -61,7 +60,7 @@ def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes: bytes):
     total_pontos = len(cnefe)
 
     # --- Rede total ---
-    buffer_total = rede.geometry.buffer(BUFFER_M, resolution=BUFFER_RESOLUTION).union_all()
+    buffer_total = rede.geometry.buffer(buffer_m, resolution=BUFFER_RESOLUTION).union_all()
     dentro_total = cnefe.within(buffer_total)
     qtd_total = int(dentro_total.sum())
 
@@ -70,7 +69,7 @@ def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes: bytes):
     if col_trat is not None:
         rede_trat = rede[rede[col_trat].astype(str).str.strip().str.lower() == TREAT_VALUE.lower()]
         if len(rede_trat) > 0:
-            buffer_trat = rede_trat.geometry.buffer(BUFFER_M, resolution=BUFFER_RESOLUTION).union_all()
+            buffer_trat = rede_trat.geometry.buffer(buffer_m, resolution=BUFFER_RESOLUTION).union_all()
             dentro_trat = cnefe.within(buffer_trat)
             qtd_trat = int(dentro_trat.sum())
         else:
@@ -82,6 +81,7 @@ def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes: bytes):
 
     resultado = {
         "Município": nome_municipio.title(),
+        "Buffer (m)": buffer_m,
         "Pontos CNEFE (total)": total_pontos,
         "Cobertos - Rede Total": qtd_total,
         "% Rede Total": round(100 * qtd_total / total_pontos, 2) if total_pontos else 0,
@@ -176,10 +176,17 @@ def montar_mapa(cnefe_4326: gpd.GeoDataFrame, rede_4326: gpd.GeoDataFrame, col_t
 # ----------------------------------------------------------------------
 # Interface
 # ----------------------------------------------------------------------
-st.title("📍 Cobertura de Rede de Esgoto — Buffer 15m")
+st.title("📍 Cobertura de Rede de Esgoto")
 st.caption(
-    "Cruza pontos CNEFE com a rede de esgoto (buffer de 15m). "
+    "Cruza pontos CNEFE com a rede de esgoto usando um buffer de distância à sua escolha. "
     "Calcula cobertura pela rede total e pela rede com tratamento (`Tratamento = Sim`)."
+)
+
+buffer_m = st.radio(
+    "Distância do buffer:",
+    options=[15, 30, 50],
+    format_func=lambda v: f"{v} metros",
+    horizontal=True,
 )
 
 col1, col2 = st.columns(2)
@@ -218,7 +225,7 @@ if arquivos_rede and arquivos_cnefe:
     if not nomes_comuns:
         st.error("Nenhum par rede/CNEFE encontrado. Verifique os nomes dos arquivos.")
     else:
-        if st.button(f"▶️ Processar {len(nomes_comuns)} município(s)", type="primary"):
+        if st.button(f"▶️ Processar {len(nomes_comuns)} município(s) com buffer de {buffer_m}m", type="primary"):
             resultados = []
             geodados = {}  # nome -> (cnefe_4326, rede_4326, col_trat)
             progresso = st.progress(0.0, text="Iniciando...")
@@ -229,7 +236,9 @@ if arquivos_rede and arquivos_cnefe:
                 try:
                     rede_file = mapa_rede[nome]
                     cnefe_file = mapa_cnefe[nome]
-                    resultado, cnefe_4326, rede_4326 = processar_par(nome, rede_file.getvalue(), cnefe_file.getvalue())
+                    resultado, cnefe_4326, rede_4326 = processar_par(
+                        nome, rede_file.getvalue(), cnefe_file.getvalue(), buffer_m
+                    )
                     resultados.append(resultado)
                     col_trat = encontrar_coluna_tratamento(rede_4326)
                     geodados[resultado["Município"]] = (cnefe_4326, rede_4326, col_trat)
@@ -244,13 +253,15 @@ if arquivos_rede and arquivos_cnefe:
             if resultados:
                 st.session_state["resultados_df"] = pd.DataFrame(resultados)
                 st.session_state["geodados"] = geodados
+                st.session_state["buffer_m_usado"] = buffer_m
 
     # Exibe resultados (persistem entre interações via session_state)
     if "resultados_df" in st.session_state:
         df = st.session_state["resultados_df"]
         geodados = st.session_state["geodados"]
+        buffer_m_usado = st.session_state["buffer_m_usado"]
 
-        st.success(f"{len(df)} município(s) processado(s) com sucesso.")
+        st.success(f"{len(df)} município(s) processado(s) com sucesso — buffer de {buffer_m_usado}m.")
         st.dataframe(df, use_container_width=True, hide_index=True)
 
         st.subheader("Totais consolidados")
@@ -276,7 +287,7 @@ if arquivos_rede and arquivos_cnefe:
         st.download_button(
             "⬇️ Baixar resultado em Excel",
             data=buffer_xlsx.getvalue(),
-            file_name="cobertura_esgoto_por_municipio.xlsx",
+            file_name=f"cobertura_esgoto_buffer_{buffer_m_usado}m_por_municipio.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
