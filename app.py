@@ -27,14 +27,22 @@ COR_REDE_SEM_TRATAMENTO = [120, 120, 120, 180]   # cinza - linha de rede sem tra
 # Utilidades
 # ----------------------------------------------------------------------
 def normalizar_nome(nome: str) -> str:
-    """Remove prefixos conhecidos, acentos e caracteres especiais para
-    permitir o pareamento entre arquivo de rede e arquivo de CNEFE."""
+    """Remove prefixos conhecidos, sufixos de bloco (' - A', ' - B', '(Bloco X)'),
+    acentos e caracteres especiais para permitir o pareamento entre arquivo de
+    rede e arquivo(s) de CNEFE — inclusive quando o CNEFE vem dividido em blocos
+    (ex: 'CNEFE_RIO DE JANEIRO - A' e 'CNEFE_RIO DE JANEIRO - B')."""
     nome = re.sub(r"\.gpkg$", "", nome, flags=re.IGNORECASE)
     nome = re.sub(r"^(NM_MUN_|CNEFE_)", "", nome, flags=re.IGNORECASE)
+    nome = re.sub(r"\(.*?\)", "", nome)  # remove "(Bloco 4)" etc.
+    nome = re.sub(r"\s*-\s*[A-Za-z]$", "", nome)  # remove sufixo " - A" / " - B" no final
     nome = nome.replace("_", " ").strip()
     nome = unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode("ascii")
     nome = re.sub(r"\s+", " ", nome).strip().lower()
     return nome
+
+
+def eh_rio_de_janeiro(nome_normalizado: str) -> bool:
+    return nome_normalizado.strip().lower() == "rio de janeiro"
 
 
 def encontrar_coluna_tratamento(gdf: gpd.GeoDataFrame):
@@ -44,18 +52,36 @@ def encontrar_coluna_tratamento(gdf: gpd.GeoDataFrame):
     return None
 
 
-def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes: bytes, buffer_m: float):
-    """Processa um par (rede, cnefe). Retorna (dict de resultados, gdf cnefe
-    classificado em EPSG:4326, gdf rede em EPSG:4326)."""
+def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes_list: list, buffer_m: float,
+                   area_nao_urb_bytes: bytes = None):
+    """Processa um município. cnefe_bytes_list pode ter mais de um arquivo
+    (blocos), que são concatenados antes da análise. Se area_nao_urb_bytes for
+    passado (aplica-se apenas ao Rio de Janeiro), os pontos CNEFE que caírem
+    dentro dessas áreas são quantificados e expurgados do numerador e do
+    denominador antes do cálculo de cobertura.
+    Retorna (dict de resultados, gdf cnefe classificado em EPSG:4326, gdf rede em EPSG:4326)."""
     rede = gpd.read_file(io.BytesIO(rede_bytes), driver="GPKG")
-    cnefe = gpd.read_file(io.BytesIO(cnefe_bytes), driver="GPKG")
 
     if rede.crs is None:
         raise ValueError("Camada de rede sem CRS definido.")
 
-    # Reprojeta CNEFE para o CRS métrico da rede (necessário p/ buffer em metros)
-    if cnefe.crs != rede.crs:
-        cnefe = cnefe.to_crs(rede.crs)
+    # Lê e concatena os blocos de CNEFE (caso haja mais de um arquivo, ex: Rio de Janeiro A/B)
+    partes = [gpd.read_file(io.BytesIO(b), driver="GPKG") for b in cnefe_bytes_list]
+    partes = [p.to_crs(rede.crs) if p.crs != rede.crs else p for p in partes]
+    cnefe = gpd.GeoDataFrame(pd.concat(partes, ignore_index=True), crs=rede.crs)
+
+    total_pontos_bruto = len(cnefe)
+
+    # --- Expurgo de áreas não urbanizadas (somente aplicado quando fornecido) ---
+    qtd_excluidos_nao_urb = 0
+    if area_nao_urb_bytes is not None:
+        area_nao_urb = gpd.read_file(io.BytesIO(area_nao_urb_bytes), driver="GPKG")
+        if area_nao_urb.crs != rede.crs:
+            area_nao_urb = area_nao_urb.to_crs(rede.crs)
+        uniao_nao_urb = area_nao_urb.geometry.union_all()
+        dentro_area_nao_urb = cnefe.within(uniao_nao_urb)
+        qtd_excluidos_nao_urb = int(dentro_area_nao_urb.sum())
+        cnefe = cnefe[~dentro_area_nao_urb].copy()
 
     total_pontos = len(cnefe)
 
@@ -82,7 +108,9 @@ def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes: bytes, bu
     resultado = {
         "Município": nome_municipio.title(),
         "Buffer (m)": buffer_m,
-        "Pontos CNEFE (total)": total_pontos,
+        "Pontos CNEFE (bruto)": total_pontos_bruto,
+        "Excluídos - Área Não Urbanizada": qtd_excluidos_nao_urb,
+        "Pontos CNEFE (base ajustada)": total_pontos,
         "Cobertos - Rede Total": qtd_total,
         "% Rede Total": round(100 * qtd_total / total_pontos, 2) if total_pontos else 0,
         "Cobertos - Rede c/ Tratamento": qtd_trat,
@@ -91,7 +119,7 @@ def processar_par(nome_municipio: str, rede_bytes: bytes, cnefe_bytes: bytes, bu
         "Coluna Tratamento encontrada": col_trat if col_trat else "NÃO ENCONTRADA",
     }
 
-    # Classificação por ponto, para o mapa
+    # Classificação por ponto, para o mapa (apenas a base já ajustada, sem os expurgados)
     cnefe = cnefe.copy()
     cnefe["coberto_total"] = dentro_total.values
     cnefe["coberto_tratamento"] = dentro_trat.values
@@ -199,17 +227,34 @@ with col1:
     )
 with col2:
     arquivos_cnefe = st.file_uploader(
-        "Arquivos CNEFE (.gpkg) — um por município",
+        "Arquivos CNEFE (.gpkg) — um ou mais por município (ex: blocos A/B)",
         type=["gpkg"],
         accept_multiple_files=True,
         key="cnefe",
+    )
+
+with st.expander("🏙️ Particularidade do Rio de Janeiro — Áreas não urbanizadas (opcional)"):
+    st.caption(
+        "Se enviado, os pontos CNEFE do Rio de Janeiro que caírem dentro dessas áreas "
+        "serão contabilizados à parte e expurgados do numerador e denominador da cobertura. "
+        "Aplica-se apenas ao município cujo nome normalizado for 'rio de janeiro'."
+    )
+    arquivo_area_nao_urb = st.file_uploader(
+        "Áreas não urbanizadas (.gpkg) — Rio de Janeiro",
+        type=["gpkg"],
+        accept_multiple_files=False,
+        key="area_nao_urb",
     )
 
 st.divider()
 
 if arquivos_rede and arquivos_cnefe:
     mapa_rede = {normalizar_nome(f.name): f for f in arquivos_rede}
-    mapa_cnefe = {normalizar_nome(f.name): f for f in arquivos_cnefe}
+    mapa_cnefe = {}
+    for f in arquivos_cnefe:
+        mapa_cnefe.setdefault(normalizar_nome(f.name), []).append(f)
+
+    area_nao_urb_bytes_global = arquivo_area_nao_urb.getvalue() if arquivo_area_nao_urb is not None else None
 
     nomes_comuns = sorted(set(mapa_rede.keys()) & set(mapa_cnefe.keys()))
     nomes_sem_par_rede = sorted(set(mapa_rede.keys()) - set(mapa_cnefe.keys()))
@@ -221,6 +266,12 @@ if arquivos_rede and arquivos_cnefe:
                 st.write("Rede sem CNEFE correspondente:", nomes_sem_par_rede)
             if nomes_sem_par_cnefe:
                 st.write("CNEFE sem rede correspondente:", nomes_sem_par_cnefe)
+
+    with st.expander("🔗 Pareamento de arquivos identificado"):
+        for nome in nomes_comuns:
+            n_blocos = len(mapa_cnefe[nome])
+            aviso_rio = " — 🏙️ área não urbanizada será aplicada" if (eh_rio_de_janeiro(nome) and area_nao_urb_bytes_global) else ""
+            st.write(f"**{nome.title()}**: {n_blocos} arquivo(s) CNEFE{aviso_rio}")
 
     if not nomes_comuns:
         st.error("Nenhum par rede/CNEFE encontrado. Verifique os nomes dos arquivos.")
@@ -235,9 +286,10 @@ if arquivos_rede and arquivos_cnefe:
                 progresso.progress((i) / len(nomes_comuns), text=f"Processando {nome.title()}...")
                 try:
                     rede_file = mapa_rede[nome]
-                    cnefe_file = mapa_cnefe[nome]
+                    cnefe_bytes_list = [f.getvalue() for f in mapa_cnefe[nome]]
+                    area_bytes = area_nao_urb_bytes_global if eh_rio_de_janeiro(nome) else None
                     resultado, cnefe_4326, rede_4326 = processar_par(
-                        nome, rede_file.getvalue(), cnefe_file.getvalue(), buffer_m
+                        nome, rede_file.getvalue(), cnefe_bytes_list, buffer_m, area_bytes
                     )
                     resultados.append(resultado)
                     col_trat = encontrar_coluna_tratamento(rede_4326)
@@ -265,11 +317,20 @@ if arquivos_rede and arquivos_cnefe:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
         st.subheader("Totais consolidados")
-        total_pontos = df["Pontos CNEFE (total)"].sum()
+        total_bruto = df["Pontos CNEFE (bruto)"].sum()
+        total_excluidos = df["Excluídos - Área Não Urbanizada"].sum()
+        total_pontos = df["Pontos CNEFE (base ajustada)"].sum()
         total_cobertos = df["Cobertos - Rede Total"].sum()
         total_trat = df["Cobertos - Rede c/ Tratamento"].sum()
+
+        if total_excluidos > 0:
+            st.caption(
+                f"⚠️ {total_excluidos:,} ponto(s) excluído(s) por estarem em área não urbanizada "
+                f"(Rio de Janeiro) — já removidos do numerador e denominador abaixo.".replace(",", ".")
+            )
+
         cA, cB, cC = st.columns(3)
-        cA.metric("Pontos CNEFE (total)", f"{total_pontos:,}".replace(",", "."))
+        cA.metric("Pontos CNEFE (base ajustada)", f"{total_pontos:,}".replace(",", "."))
         cB.metric(
             "Cobertos - Rede Total",
             f"{total_cobertos:,}".replace(",", "."),
@@ -322,11 +383,18 @@ else:
 with st.expander("ℹ️ Como funciona o pareamento de arquivos"):
     st.markdown(
         """
-        O app casa cada arquivo de **rede** com seu arquivo **CNEFE** pelo nome do município
-        extraído do nome do arquivo (removendo prefixos como `NM_MUN_` / `CNEFE_`, acentos e underscores).
+        O app casa cada arquivo de **rede** com o(s) arquivo(s) **CNEFE** pelo nome do município
+        extraído do nome do arquivo (removendo prefixos como `NM_MUN_` / `CNEFE_`, sufixos de
+        bloco como `- A` / `- B` / `(Bloco 4)`, acentos e underscores).
 
         Exemplo: `NM_MUN_São_Gonçalo.gpkg` ↔ `CNEFE_São_Gonçalo.gpkg` → pareados como **"são goncalo"**.
 
-        Certifique-se de manter esse padrão de nomenclatura para todos os municípios.
+        Se houver mais de um arquivo CNEFE para o mesmo município (ex: `CNEFE_RIO DE JANEIRO - A.gpkg`
+        e `CNEFE_RIO DE JANEIRO - B.gpkg`), eles são **somados automaticamente** antes da análise.
+
+        **Áreas não urbanizadas (Rio de Janeiro):** se um arquivo for enviado no campo específico,
+        os pontos CNEFE do Rio de Janeiro que caírem dentro dessas áreas são contabilizados à parte
+        (coluna "Excluídos - Área Não Urbanizada") e removidos do numerador e denominador da cobertura.
+        Não afeta nenhum outro município.
         """
     )
